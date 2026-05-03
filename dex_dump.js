@@ -1,25 +1,28 @@
-// ==================== DEX DUMP & FIX SCRIPT v5.1 ====================
-// Focus: dump quality against DexProtector / Licel and similar packers
-// that decrypt lazily and wipe regions on demand.
+// ==================== DEX DUMP & FIX SCRIPT v5.2 ====================
+// Focus: dump DEX from packed APKs (DexProtector / Licel etc.) when the
+// runtime is killed on Frida detection.
 //
-// Changes vs v5:
-//   + Region content watcher — same base/size re-dumped when content
-//     changes (catches lazy-decrypted methods landing in same buffer)
-//   + mprotect/mprotect64 hook — detects PROT_EXEC transitions
-//     (a freshly-decrypted code window) and tries to dump
-//   + madvise hook — when MADV_DONTNEED/MADV_FREE/MADV_REMOVE wipes a
-//     known DEX region, dump before the wipe ("rescue mode")
-//   + Extra DexFile entry points: OpenMemory, OpenAndReadMagic,
-//     ArtDexFileLoader::Open*, plus generic OpenCommon
-//   + Stable filenames now also include monotonic timestamp so you can
-//     correlate dumps with steps you took in the app
-//   + Bug fixes:
-//        - capture mmap size into local before setTimeout
-//        - removed dead branch in repairDex (firstNonZero/looksZeroed)
-//        - prefer Process.enumerateRanges (sync) for forward compat
-//        - clamp scan range to (CFG.MIN_DEX_SIZE..CFG.MAX_DEX_SIZE)
-//        - guard repairDex against pathological shifted-DEX (size==0)
-//        - explicit summary line in periodic scan + on app exit
+// Changes vs v5.1:
+//   + Frida anti-detection module installed synchronously at load:
+//        - filters lines from /proc/self/maps, /proc/self/status,
+//          /proc/self/task/<tid>/{maps,status} containing frida-agent,
+//          gum-js-loop, gmain, gdbus, gum-rt, linjector, libfridagadget
+//        - rewrites pthread_getname_np / prctl(PR_GET_NAME) outputs
+//          for known Frida thread names
+//        - hides files like /data/local/tmp/re.frida.server,
+//          /data/local/tmp/frida-server (access/stat/lstat -> ENOENT)
+//        - ptrace(PTRACE_TRACEME) always returns 0
+//        - all hooks installed BEFORE setImmediate so DexProtector init
+//          sees a clean view from the very first check
+//   + No banner/log spew before evasion is in place (DexProtector also
+//     scans console output buffers in some builds)
+//
+// Earlier (v5/5.1) features kept:
+//   + ClassLinker::DefineClass + multi DexFile loaders + mmap +
+//     mprotect(PROT_EXEC) + madvise(MADV_DONTNEED/FREE/REMOVE) + dlopen
+//   + Real DEX repair: shifted-magic search, file_size, Adler-32
+//     checksum, SHA-1 signature
+//   + Region content watcher for lazy-decrypted methods
 // ===================================================================
 
 'use strict';
@@ -45,8 +48,278 @@ const CFG = {
     INITIAL_SCAN_DELAY:  2000,
     MAX_HEADER_SEARCH:   0x100000,              // 1 MiB shifted-DEX search window
     REGION_WATCH_HEAD:   4096,                  // bytes hashed for change detection
-    OUTPUT_DIR:          null                   // resolved at startup
+    OUTPUT_DIR:          null,                  // resolved at startup
+    EVADE:               true                   // install Frida anti-detection
 };
+
+// ====================================================================
+// ANTI-DETECTION (Frida hide) — must run synchronously, ASAP
+// ====================================================================
+// Substrings that should not appear in /proc/self/maps and similar
+const FRIDA_PATH_NEEDLES = [
+    "frida-agent", "frida-gadget", "libfridagadget",
+    "gum-js-loop", "gum-rt", "linjector",
+    "frida-helper", "re.frida"
+];
+// Thread name needles (rewritten to a benign name)
+const FRIDA_THREAD_NEEDLES = [
+    "gum-js-loop", "gmain", "gdbus", "pool-frida",
+    "frida-agent", "linjector", "gum-rt"
+];
+// File paths whose existence we deny
+const FRIDA_FILE_PATHS = [
+    "/data/local/tmp/re.frida.server",
+    "/data/local/tmp/frida-server",
+    "/data/local/tmp/frida-agent",
+    "/data/local/tmp/frida-gadget",
+    "/system/bin/frida-server",
+    "/system/xbin/frida-server"
+];
+// FDs we know point at /proc/self/maps and similar (need read() filtering)
+const procFdSet = new Set();
+
+function strContainsAnyLower(s, list) {
+    const lower = s.toLowerCase();
+    for (let i = 0; i < list.length; i++) {
+        if (lower.indexOf(list[i]) !== -1) return true;
+    }
+    return false;
+}
+
+// Filter the buffer that was just filled by read(fd, buf, n).
+// Replaces bytes inside lines containing FRIDA_PATH_NEEDLES with spaces,
+// keeps newlines so line-based parsers still see the same line count.
+function filterMapsBuffer(bufPtr, bytesRead) {
+    if (bytesRead <= 0) return;
+    let raw;
+    try { raw = bufPtr.readByteArray(bytesRead); }
+    catch (_) { return; }
+    const u8 = new Uint8Array(raw);
+    let lineStart = 0;
+    let mutated = false;
+    for (let i = 0; i <= bytesRead; i++) {
+        if (i === bytesRead || u8[i] === 0x0A) {
+            const lineLen = i - lineStart;
+            if (lineLen > 0) {
+                let lineStr = "";
+                for (let j = lineStart; j < i; j++) lineStr += String.fromCharCode(u8[j]);
+                if (strContainsAnyLower(lineStr, FRIDA_PATH_NEEDLES)) {
+                    for (let j = lineStart; j < i; j++) u8[j] = 0x20; // space
+                    mutated = true;
+                }
+            }
+            lineStart = i + 1;
+        }
+    }
+    if (mutated) {
+        try { bufPtr.writeByteArray(u8.buffer); } catch (_) {}
+    }
+}
+
+function isProcPathSensitive(path) {
+    if (!path) return false;
+    // /proc/self/maps, /proc/self/status, /proc/self/task/<tid>/maps, /proc/<pid>/maps, ...
+    if (path.indexOf("/proc/") !== 0) return false;
+    return path.indexOf("/maps") !== -1
+        || path.indexOf("/status") !== -1
+        || path.indexOf("/smaps") !== -1
+        || path.indexOf("/cmdline") !== -1;
+}
+
+let evadeStats = { tried: 0, ok: 0, names: [] };
+
+function installFridaEvade() {
+    if (!CFG.EVADE) return;
+
+    const libc = (() => {
+        try { return Process.findModuleByName("libc.so") || Process.findModuleByName("libc.bionic"); }
+        catch (_) { return null; }
+    })();
+    if (!libc) return;
+
+    function exp(name) {
+        try { return Module.findExportByName("libc.so", name) || Module.findExportByName(null, name); }
+        catch (_) { return null; }
+    }
+    function safeAttach(label, ptr_, cbs) {
+        if (!ptr_) return false;
+        evadeStats.tried++;
+        try {
+            Interceptor.attach(ptr_, cbs);
+            evadeStats.ok++;
+            evadeStats.names.push(label);
+            return true;
+        } catch (_) { return false; }
+    }
+
+    // ---- open / openat: track sensitive FDs ----
+    safeAttach("open", exp("open"), {
+        onEnter(args) {
+            try { this.path = args[0].readCString(); } catch (_) { this.path = null; }
+        },
+        onLeave(retval) {
+            const fd = retval.toInt32();
+            if (fd >= 0 && this.path && isProcPathSensitive(this.path)) {
+                procFdSet.add(fd);
+            }
+        }
+    });
+    safeAttach("openat", exp("openat"), {
+        onEnter(args) {
+            try { this.path = args[1].readCString(); } catch (_) { this.path = null; }
+        },
+        onLeave(retval) {
+            const fd = retval.toInt32();
+            if (fd >= 0 && this.path && isProcPathSensitive(this.path)) {
+                procFdSet.add(fd);
+            }
+        }
+    });
+
+    // ---- read / pread: filter buffers when fd is sensitive ----
+    safeAttach("read", exp("read"), {
+        onEnter(args) {
+            this.fd = args[0].toInt32();
+            this.buf = args[1];
+        },
+        onLeave(retval) {
+            if (!procFdSet.has(this.fd)) return;
+            const n = retval.toInt32();
+            if (n > 0) filterMapsBuffer(this.buf, n);
+        }
+    });
+    safeAttach("pread", exp("pread") || exp("pread64"), {
+        onEnter(args) {
+            this.fd = args[0].toInt32();
+            this.buf = args[1];
+        },
+        onLeave(retval) {
+            if (!procFdSet.has(this.fd)) return;
+            const n = retval.toInt32();
+            if (n > 0) filterMapsBuffer(this.buf, n);
+        }
+    });
+
+    // ---- close: drop tracked FDs ----
+    safeAttach("close", exp("close"), {
+        onEnter(args) {
+            const fd = args[0].toInt32();
+            if (procFdSet.has(fd)) procFdSet.delete(fd);
+        }
+    });
+
+    // ---- fopen / fopen64: filter via stdio path too. We can't easily
+    //      read FILE* internals, so we wrap fgets / getline / fread to
+    //      detect when these were used. But the simplest reliable trick:
+    //      if path is /proc/self/maps-like, redirect to a pre-filtered
+    //      tmpfile. To keep this lightweight we just hook fgets/getline
+    //      and post-filter. ----
+    safeAttach("fgets", exp("fgets"), {
+        onEnter(args) {
+            this.buf = args[0];
+        },
+        onLeave(retval) {
+            if (retval.isNull() || !this.buf) return;
+            let line;
+            try { line = this.buf.readCString(); } catch (_) { return; }
+            if (line && strContainsAnyLower(line, FRIDA_PATH_NEEDLES)) {
+                try { this.buf.writeUtf8String("\n"); } catch (_) {}
+            }
+        }
+    });
+    safeAttach("getline", exp("getline"), {
+        onEnter(args) {
+            this.lineptrPtr = args[0];
+        },
+        onLeave(retval) {
+            if (retval.toInt32() <= 0) return;
+            try {
+                const linePtr = this.lineptrPtr.readPointer();
+                if (linePtr.isNull()) return;
+                const line = linePtr.readCString();
+                if (line && strContainsAnyLower(line, FRIDA_PATH_NEEDLES)) {
+                    linePtr.writeUtf8String("\n");
+                }
+            } catch (_) {}
+        }
+    });
+
+    // ---- access / faccessat / stat / lstat / __xstat / __lxstat: hide files ----
+    function isFridaFile(p) {
+        if (!p) return false;
+        for (let i = 0; i < FRIDA_FILE_PATHS.length; i++) {
+            if (p === FRIDA_FILE_PATHS[i] || p.indexOf(FRIDA_FILE_PATHS[i]) === 0) return true;
+        }
+        // Also hide any /data/local/tmp/frida* and /data/local/tmp/re.frida*
+        if (p.indexOf("/data/local/tmp/frida") === 0) return true;
+        if (p.indexOf("/data/local/tmp/re.frida") === 0) return true;
+        return false;
+    }
+    function denyHook(name, pathArgIndex) {
+        safeAttach(name, exp(name), {
+            onEnter(args) {
+                let path = null;
+                try { path = args[pathArgIndex].readCString(); } catch (_) {}
+                this.deny = isFridaFile(path);
+            },
+            onLeave(retval) {
+                if (this.deny) retval.replace(ptr(-1));
+            }
+        });
+    }
+    denyHook("access",   0);
+    denyHook("faccessat",1);
+    denyHook("stat",     0);
+    denyHook("lstat",    0);
+    denyHook("__xstat",  1);
+    denyHook("__lxstat", 1);
+    denyHook("stat64",   0);
+    denyHook("lstat64",  0);
+
+    // ---- pthread_getname_np: rewrite Frida thread names ----
+    safeAttach("pthread_getname_np", exp("pthread_getname_np"), {
+        onEnter(args) { this.buf = args[1]; },
+        onLeave(retval) {
+            if (retval.toInt32() !== 0 || !this.buf) return;
+            try {
+                const name = this.buf.readCString();
+                if (name && strContainsAnyLower(name, FRIDA_THREAD_NEEDLES)) {
+                    this.buf.writeUtf8String("Binder:0_0");
+                }
+            } catch (_) {}
+        }
+    });
+
+    // ---- prctl(PR_GET_NAME=16, name): rewrite ----
+    safeAttach("prctl", exp("prctl"), {
+        onEnter(args) {
+            this.op = args[0].toInt32();
+            this.namePtr = args[1];
+        },
+        onLeave(retval) {
+            if (this.op !== 16 /* PR_GET_NAME */ || retval.toInt32() !== 0) return;
+            try {
+                const name = this.namePtr.readCString();
+                if (name && strContainsAnyLower(name, FRIDA_THREAD_NEEDLES)) {
+                    this.namePtr.writeUtf8String("Binder:0_0");
+                }
+            } catch (_) {}
+        }
+    });
+
+    // ---- ptrace: PTRACE_TRACEME (req=0) always succeeds ----
+    safeAttach("ptrace", exp("ptrace"), {
+        onEnter(args) { this.req = args[0].toInt32(); },
+        onLeave(retval) {
+            if (this.req === 0 /* PTRACE_TRACEME */) {
+                retval.replace(ptr(0));
+            }
+        }
+    });
+}
+
+// Install evasion synchronously, before anything else.
+try { installFridaEvade(); } catch (_) {}
 
 // ---------- STATE ----------
 const seenAddr        = new Set();              // addresses processed at least once
@@ -615,10 +888,13 @@ setImmediate(() => {
     CFG.OUTPUT_DIR = `/data/data/${processName}`;
 
     console.log("\n" + "=".repeat(64));
-    Cyan(`DEX DUMP & FIX SCRIPT v5.1`);
+    Cyan(`DEX DUMP & FIX SCRIPT v5.2`);
     Cyan(`App:  ${processName}`);
     Cyan(`Arch: ${Process.arch}   PID: ${Process.id}   PtrSize: ${Process.pointerSize}`);
     Cyan(`Out:  ${CFG.OUTPUT_DIR}`);
+    if (CFG.EVADE) {
+        Cyan(`Evade: ${evadeStats.ok}/${evadeStats.tried} hooks (${evadeStats.names.join(",")})`);
+    }
     console.log("=".repeat(64) + "\n");
 
     Blue("[*] Installing hooks…");

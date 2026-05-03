@@ -9,6 +9,18 @@ classes lazily (DexProtector / Licel and similar).
 
 ### What it does
 
+- **Anti-detection (Frida hide)** — installed synchronously at load, before
+  any other hook so DexProtector's startup checks see a clean process:
+  - Filters lines containing `frida-agent`, `frida-gadget`, `libfridagadget`,
+    `gum-js-loop`, `gum-rt`, `linjector`, `frida-helper`, `re.frida` from
+    `/proc/self/maps`, `/proc/self/status`, `/proc/self/task/<tid>/maps`,
+    `/proc/self/cmdline` (intercepts `read`, `pread`, `fgets`, `getline`).
+  - Rewrites Frida thread names (`gum-js-loop`, `gmain`, `gdbus`,
+    `pool-frida`) returned by `pthread_getname_np` and `prctl(PR_GET_NAME)`.
+  - Hides `/data/local/tmp/{frida-server,frida-agent,frida-gadget,
+    re.frida.server}` and similar from `access`/`stat`/`lstat`.
+  - `ptrace(PTRACE_TRACEME)` always returns 0.
+  - Configurable via `CFG.EVADE` (set to `false` for pure dumping).
 - Hooks the runtime so a DEX is captured the moment it is created or used:
   - `art::ClassLinker::DefineClass` (probes multiple `DexFile` layouts)
   - Multiple `DexFile` loaders (`OpenCommon`, `OpenMemory`, `OpenAndReadMagic`,
